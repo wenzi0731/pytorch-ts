@@ -1,0 +1,14 @@
+# Exactly six configurations; select with validation macro_nCRPS only.
+configurations:
+  - id: c01_h40_lr1e3
+    overrides: {model.num_cells: 40, training.learning_rate: 0.001}
+  - id: c02_h40_lr1e4
+    overrides: {model.num_cells: 40, training.learning_rate: 0.0001}
+  - id: c03_h80_lr1e3
+    overrides: {model.num_cells: 80, training.learning_rate: 0.001}
+  - id: c04_h80_lr1e4
+    overrides: {model.num_cells: 80, training.learning_rate: 0.0001}
+  - id: c05_h128_lr1e3
+    overrides: {model.num_cells: 128, training.learning_rate: 0.001}
+  - id: c06_h128_lr1e4
+    overrides: {model.num_cells: 128, training.learning_rate: 0.0001}

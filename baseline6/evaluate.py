@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import argparse
+import json
+import time
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from baseline6.data import HEEWConditionDataset
+from baseline6.reporting import require_empty_output, write_report
+from baseline6.model import ConditionalTimeGrad, generate_scenarios
+from baseline6.runtime import choose_device, load_checkpoint, resolve_path, seed_everything
+from baseline6.train import data_manifest
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate conditional joint TimeGrad.")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--energy-path", default=None)
+    parser.add_argument("--weather-path", default=None)
+    parser.add_argument("--outdir", "--output-dir", default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--scenarios", "--num-scenarios", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max-days", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    checkpoint_path = resolve_path(args.checkpoint)
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint.get("method") != "conditional-timegrad-baseline6":
+        raise ValueError("Expected a baseline6 TimeGrad checkpoint")
+    config = checkpoint["config"]
+    seed = int(args.seed if args.seed is not None else config["run"]["seed"])
+    seed_everything(seed)
+    args.scenarios = int(config["evaluation"]["test_scenarios"]) if args.scenarios is None else args.scenarios
+    args.batch_size = int(config["evaluation"]["batch_size"]) if args.batch_size is None else args.batch_size
+    if args.scenarios < 1 or args.batch_size < 1 or (args.max_days is not None and args.max_days < 1):
+        raise ValueError("Counts must be positive")
+    device = choose_device(args.device)
+    data_config = config["data"]
+    dataset = HEEWConditionDataset(
+        energy_path=resolve_path(args.energy_path or data_config["energy_path"]),
+        weather_path=resolve_path(args.weather_path or data_config["weather_path"]),
+        split="test",
+        weather_feature_set=data_config.get("weather_feature_set", "pv10"),
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    manifest_config = json.loads(json.dumps(config))
+    manifest_config["data"]["energy_path"] = str(args.energy_path or data_config["energy_path"])
+    manifest_config["data"]["weather_path"] = str(args.weather_path or data_config["weather_path"])
+    if data_manifest(manifest_config, dataset) != checkpoint["data_manifest"]:
+        raise ValueError("Data or normalization differs from training checkpoint")
+    generator = ConditionalTimeGrad(config, dataset.condition_channels)
+    generator.load_state_dict(checkpoint["model"])
+    generator.to(device).eval()
+    output_dir = (
+        resolve_path(args.outdir)
+        if args.outdir
+        else checkpoint_path.parent / "evaluation_test"
+    )
+    require_empty_output(output_dir)
+
+    generated_batches: list[np.ndarray] = []
+    target_batches: list[np.ndarray] = []
+    condition_batches: list[np.ndarray] = []
+    year_batches: list[np.ndarray] = []
+    dates: list[str] = []
+    noise_generator = torch.Generator(device=device).manual_seed(seed + 90_000)
+    elapsed = 0.0
+    processed = 0
+    with torch.no_grad():
+        for conditions, pv_year, target, batch_dates in loader:
+            if args.max_days is not None and processed >= args.max_days:
+                break
+            take = len(batch_dates)
+            if args.max_days is not None:
+                take = min(take, args.max_days - processed)
+            conditions = conditions[:take].to(device)
+            pv_year = pv_year[:take].to(device)
+            target = target[:take].to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            generated_z = generate_scenarios(
+                generator,
+                conditions,
+                pv_year,
+                args.scenarios,
+                noise_generator,
+                int(config["evaluation"]["sample_chunk_size"]),
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed += time.perf_counter() - start
+            if not torch.isfinite(generated_z).all():
+                raise FloatingPointError("Nonfinite generated scenarios before denormalization")
+            generated = dataset.denormalize(generated_z)
+            target_physical = dataset.denormalize(target)
+            generated[:, :, 3].clamp_(min=0.0)
+            generated_batches.append(generated.cpu().numpy())
+            target_batches.append(target_physical.cpu().numpy())
+            condition_batches.append(conditions.cpu().numpy())
+            year_batches.append(pv_year.cpu().numpy())
+            dates.extend(list(batch_dates[:take]))
+            processed += take
+
+    generated_values = np.concatenate(generated_batches)
+    target_values = np.concatenate(target_batches)
+    condition_values = np.concatenate(condition_batches)
+    labels = list(dataset.target_cols)
+    archive = output_dir / "baseline6_scenarios.npz"
+    metrics = write_report(
+        generated_values, target_values, dataset.target_mean, dataset.target_std,
+        dates, labels, output_dir, seed=seed, no_plots=args.no_plots,
+        precision_recall_k=int(config["evaluation"]["precision_recall_k"]),
+        max_precision_samples=int(config["evaluation"]["max_precision_samples"]),
+        metadata={
+            "method": "conditional-timegrad-baseline6",
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_epoch": checkpoint.get("epoch"),
+            "split": "test-2022",
+            "partial_test": len(target_values) != len(dataset),
+            "training_seed": int(config["run"]["seed"]),
+            "sample_seed": seed + 90_000,
+            "sampler": "DDPM_full_step_autoregressive",
+            "training_timesteps": int(generator.num_timesteps),
+            "sampling_steps": int(generator.num_timesteps),
+            "sampling_steps_per_hour": int(generator.num_timesteps),
+            "denoiser_calls_per_trajectory": 24 * int(generator.num_timesteps),
+            "conditioning_protocol": "cold_start_generated_within_day_lag1",
+            "sampling_chunk_size": int(config["evaluation"]["sample_chunk_size"]),
+            "sampling_batch_size": args.batch_size,
+            "sampling_seconds": elapsed,
+            "seconds_per_1000_scenarios": elapsed * 1000 / (len(target_values) * args.scenarios),
+            "archive": str(archive),
+        },
+    )
+    np.savez_compressed(
+        archive,
+        scenarios=generated_values,
+        targets=target_values,
+        conditions=condition_values,
+        pv_year=np.concatenate(year_batches),
+        dates=np.asarray(dates),
+        channel_names=np.asarray(labels),
+        target_mean=dataset.target_mean,
+        target_std=dataset.target_std,
+        seed=seed,
+        sample_seed=seed + 90_000,
+        sampler="DDPM_full_step_autoregressive",
+        num_scenarios=args.scenarios,
+        metadata_json=json.dumps(metrics, allow_nan=False),
+    )
+    print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))
+
+
+if __name__ == "__main__":
+    main()

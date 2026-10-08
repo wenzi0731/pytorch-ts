@@ -170,3 +170,9 @@ We have implemented the following model using this framework:
       primaryClass={cs.LG}
 }
 ```
+
+
+## HEEW TimeGrad baseline6
+
+See [README_BASELINE6.md](README_BASELINE6.md) for the condition-only joint source-load adaptation, six-configuration validation budget, and baseline5-aligned outputs. Original `pts/` code is unchanged.
+

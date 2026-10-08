@@ -108,3 +108,13 @@ wandb/
 .idea/
 runs/
 .vscode/
+
+
+# HEEW baseline6 private data and generated artifacts
+/Data/
+/experiments/
+/evaluation_results/
+*.pt
+*.pth
+*.npz
+
