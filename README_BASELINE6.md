@@ -233,3 +233,100 @@ python -m pytest -c pytest_baseline6.ini -q
 Probabilistic Time Series Forecasting”, ICML 2021, pp. 8857–8868.
 [原论文页面](https://proceedings.mlr.press/v139/rasul21a.html)。
 
+## 8. 运行速度优化（不改变六组实验协议）
+
+本次不改 T、beta schedule、模型结构、训练损失、天气条件、24h 自回归、
+训练/验证频率、batch/chunk 默认值、场景数、指标或 search_space。
+旧 checkpoint 可严格加载；原 pts/ 文件不改。
+
+实现优化：
+
+1. 每小时 DDPM 链内，天气/RNN 条件上采样和各残差层的条件投影只计算一次。
+   每小时、每个采样分块重新计算，不跨训练更新缓存，不进入 state_dict；
+   去噪网络中的其余运算次序和随机噪声生成次序保留。
+2. 正常模式将有限值检查从每扩散步移到每小时结束；完整场景检查仍保留。
+   CUDA 下避免每一步 Python 布尔判断强制等待 GPU。
+3. 模型复制/移至设备后，以及每条批量日轨迹开始前整理 LSTM/GRU 参数。
+4. 默认 ema_decay=0 时直接使用当前模型验证，去掉逐训练批次的无效影子权重复制；
+   ema_decay>0 的指数移动平均仍保持原算法。
+5. 训练、验证、测试增加阶段进度。长采样在小时/分块边界检查是否已过30秒，
+   不是后台线程，因此单次算子若阻塞，不承诺30秒内一定输出。
+   history.jsonl 新增 training_seconds、validation_seconds（验证轮）、epoch_seconds。
+   旧 completed.json 的 training_seconds 仍为整次运行耗时，包含验证。
+6. 启动打印实际模型设备、显卡名、CPU线程数；环境文件和测试元数据记录执行模式。
+
+### 更新及已运行实验
+
+代码更新不会改变已启动 Python 进程中载入的模型代码。要启用优化需要重新启动。
+先在原训练终端用 Ctrl+C 停止旧搜索（会丢失未保存进度，但不删除已有文件），
+保留整个 experiments/。不要用 kill -9，不要删除历史实验目录。
+
+在对应基线工作目录执行：
+
+```bash
+git pull --ff-only origin codex/heew-condition-baseline6
+```
+
+如果有本地改动或分支不能快进，先解决冲突，不要强制覆盖。
+
+旧版 best.pt 可直接评估/测速，但不包含完整优化器、epoch末随机数和数据加载器状态，
+**不能声称从旧第24轮精确断点续训**。该版本仍不提供完整断点恢复。
+重新训练请用新输出根目录，不覆盖已跑结果：
+
+```bash
+TIMEGRAD_CPU_THREADS=1 python -m baseline6.sweep \
+  --seed 42 \
+  --set run.device=cuda:0 \
+  --set run.output_root=experiments/baseline6_speed \
+  --output-dir experiments/baseline6_speed/tuning_budget_6
+```
+
+这里将 CPU 线程数设为1作为减少小算子线程调度的执行选项，不改网络宽度或数据批次。
+未设置 TIMEGRAD_CPU_THREADS 时保留 PyTorch 默认线程数；不能保证线程数1在所有机器最快。
+后续最终训练应使用新目录下的 best_config.yaml。不要用旧配置文件误指向旧实验路径。
+
+### 先做采样测速（无需数据 CSV，无写入）
+
+在没有旧训练占用显卡时执行：
+
+```bash
+python -m baseline6.benchmark \
+  --device cuda:0 \
+  --batch-size 8 \
+  --scenarios 20 \
+  --chunk-size 128 \
+  --repeats 3 \
+  --threads 1
+```
+
+可附加 `--checkpoint experiments/baseline6/timegrad_tune_c01_h40_lr1e3_seed42/best.pt`
+使用已有权重及 T，否则加载默认配置和未训练权重。
+测速用固定的合成条件，不测试真实场景质量，不执行六组搜索、不保存任何文件。
+两种模式均先整理 RNN 权重，所以此测速不衡量修复权重警告或去掉训练 EMA 复制的收益。
+
+输出包含：
+
+- reference/optimized 的采样耗时中位数与 sampler_speedup；
+- max_abs_difference、bitwise_equal、within_tolerance；
+- rng_state_equal（采样噪声流状态必须相同）；
+- 实际设备/显卡、线程、T、batch/chunk 和场景数。
+
+数值差异超出 rtol=1e-5、atol=1e-6 或 RNG 状态不一致会报错，先检查再用新结果。
+本地 CPU 测试逐元素一致不等于承诺所有 CUDA/PyTorch 版本逐位一致；
+真实4090的提速倍数应以此命令实测为准。不得用这项采样微基准代替完整训练/验证耗时。
+
+### 调试与回退开关
+
+以下环境变量只控制执行方式，不添加或修改配置哈希：
+
+- TIMEGRAD_DEBUG_CHECKS=1：重新启用逐扩散步异常检查，定位NaN时用。
+- TIMEGRAD_CACHE_CONDITIONER=0：关闭条件缓存，使用原始去噪 forward 参考路径。
+- TIMEGRAD_CPU_THREADS=1：限制CPU算子线程；记录到 environment.json。
+- TIMEGRAD_PROGRESS=0：关闭额外阶段进度，不关闭原 epoch 日志。
+
+默认开启缓存、关闭逐步检查、开启进度；正常模式仍拒绝非有限小时/完整场景。
+不启用混合精度、不减少精度、不改 DDPM 为 DDIM、不修改采样分块来获得测速优势。
+
+如果更新后显卡仍持续0%，看最后一个 phase 和实际设备，再定位线程/调用栈。
+本次优化处理已确认的实现开销，但尚未获得原服务器调用栈，不能保证它解决所有阻塞原因。
+

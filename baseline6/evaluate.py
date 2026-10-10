@@ -18,6 +18,7 @@ from baseline6.reporting import require_empty_output, write_report
 from baseline6.model import ConditionalTimeGrad, generate_scenarios
 from baseline6.runtime import choose_device, load_checkpoint, resolve_path, seed_everything
 from baseline6.train import data_manifest
+from baseline6.performance import Progress, configure_threads, execution_info
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_threads()
     args = parse_args()
     checkpoint_path = resolve_path(args.checkpoint)
     checkpoint = load_checkpoint(checkpoint_path)
@@ -65,12 +67,16 @@ def main() -> None:
     generator = ConditionalTimeGrad(config, dataset.condition_channels)
     generator.load_state_dict(checkpoint["model"])
     generator.to(device).eval()
+    generator.rnn.flatten_parameters()
     output_dir = (
         resolve_path(args.outdir)
         if args.outdir
         else checkpoint_path.parent / "evaluation_test"
     )
     require_empty_output(output_dir)
+    progress = Progress("test_sampling")
+    progress.emit(force=True, phase="start", days=min(args.max_days or len(dataset), len(dataset)),
+                  scenarios=args.scenarios, **execution_info(generator))
 
     generated_batches: list[np.ndarray] = []
     target_batches: list[np.ndarray] = []
@@ -100,6 +106,9 @@ def main() -> None:
                 args.scenarios,
                 noise_generator,
                 int(config["evaluation"]["sample_chunk_size"]),
+                progress=lambda done, total, hour=None: progress.emit(
+                    phase="sampling", completed_days=processed,
+                    chunk_scenarios_done=done, batch_scenarios=total, hour=hour),
             )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -115,6 +124,8 @@ def main() -> None:
             year_batches.append(pv_year.cpu().numpy())
             dates.extend(list(batch_dates[:take]))
             processed += take
+            progress.emit(phase="batch_done", completed_days=processed)
+    progress.emit(force=True, phase="done", completed_days=processed)
 
     generated_values = np.concatenate(generated_batches)
     target_values = np.concatenate(target_batches)
@@ -127,6 +138,7 @@ def main() -> None:
         precision_recall_k=int(config["evaluation"]["precision_recall_k"]),
         max_precision_samples=int(config["evaluation"]["max_precision_samples"]),
         metadata={
+            **execution_info(generator),
             "method": "conditional-timegrad-baseline6",
             "checkpoint": str(checkpoint_path),
             "checkpoint_epoch": checkpoint.get("epoch"),

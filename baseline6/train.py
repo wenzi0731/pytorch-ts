@@ -22,6 +22,7 @@ from baseline6.metrics import crps_map
 from baseline6.model import ConditionalTimeGrad, generate_scenarios
 from baseline6.runtime import choose_device, load_config, resolve_path, seed_everything, seed_worker
 from baseline6.upstream import UPSTREAM_COMMIT
+from baseline6.performance import Progress, configure_threads, execution_info, synchronize
 
 
 def config_hash(config):
@@ -54,14 +55,21 @@ def make_dataset(config, split):
 @torch.no_grad()
 def validate(model, loader, dataset, config, device):
     model.eval()
+    model.rnn.flatten_parameters()
+    progress = Progress("validation")
+    progress.emit(force=True, phase="start", batches=len(loader),
+                  days=len(dataset), **execution_info(model))
     rng = torch.Generator(device=device).manual_seed(int(config["run"]["seed"]) + 50000)
     scores = np.zeros(4, dtype=np.float64)
     denominators = np.zeros(4, dtype=np.float64)
-    for conditions, pv_year, target, _ in loader:
+    for batch_index, (conditions, pv_year, target, _) in enumerate(loader, 1):
         samples = generate_scenarios(
             model, conditions.to(device), pv_year.to(device),
             int(config["evaluation"]["val_scenarios"]), rng,
             int(config["evaluation"]["sample_chunk_size"]),
+            progress=lambda done, total, hour=None: progress.emit(
+                phase="sampling", batch=batch_index, batches=len(loader),
+                chunk_scenarios_done=done, batch_scenarios=total, hour=hour),
         )
         if not torch.isfinite(samples).all():
             raise FloatingPointError("Nonfinite validation scenarios")
@@ -70,6 +78,8 @@ def validate(model, loader, dataset, config, device):
         truth = dataset.denormalize(target).numpy()
         scores += crps_map(physical, truth).sum(axis=(0, 2))
         denominators += np.abs(truth).sum(axis=(0, 2))
+        progress.emit(force=batch_index in (1, len(loader)), phase="batch_done",
+                      batch=batch_index, batches=len(loader))
     result = {"val_macro_nCRPS": float((scores / (denominators + 1e-8)).mean())}
     result.update({f"val_{label}_nCRPS": float(scores[i] / (denominators[i] + 1e-8))
                    for i, label in enumerate(dataset.target_cols)})
@@ -77,6 +87,7 @@ def validate(model, loader, dataset, config, device):
 
 
 def train(config, run_name=None):
+    configure_threads()
     seed = int(config["run"]["seed"])
     seed_everything(seed)
     if config["data"].get("seq_len", 24) != 24:
@@ -102,10 +113,14 @@ def train(config, run_name=None):
         generator=torch.Generator().manual_seed(seed + 1),
     )
     model = ConditionalTimeGrad(config, train_data.condition_channels).to(device)
-    ema = deepcopy(model).eval().requires_grad_(False)
     decay = float(training["ema_decay"])
     if not 0 <= decay < 1:
         raise ValueError("ema_decay must be in [0,1)")
+    # Zero-decay EMA is the current model: avoid hundreds of tiny CUDA copies
+    # every training batch. Never freeze the training model in this case.
+    ema = deepcopy(model).eval().requires_grad_(False) if decay > 0 else model
+    model.rnn.flatten_parameters()
+    ema.rnn.flatten_parameters()
     optimizer = torch.optim.Adam(
         model.parameters(), lr=float(training["learning_rate"]), betas=tuple(training["betas"])
     )
@@ -116,14 +131,22 @@ def train(config, run_name=None):
                    "device": str(device), "parameters": sum(p.numel() for p in model.parameters()),
                    "upstream_commit": UPSTREAM_COMMIT,
                    "conditioning_protocol": "cold_start_generated_within_day_lag1"}
+    environment.update(execution_info(model))
     (run_dir / "environment.json").write_text(json.dumps(environment, indent=2))
+    print(json.dumps({"event": "run_start", "run_dir": str(run_dir),
+                      "train_days": len(train_data), "validation_days": len(val_data),
+                      **environment}), flush=True)
     best_score, stale = float("inf"), 0
     best_path = run_dir / "best.pt"
     started = time.perf_counter()
     for epoch in range(1, int(training["epochs"]) + 1):
+        synchronize(device)
+        epoch_started = time.perf_counter()
+        progress = Progress("training", epoch=epoch)
+        progress.emit(force=True, phase="start", batches=len(train_loader))
         model.train()
         loss_sum, seen = 0.0, 0
-        for conditions, pv_year, target, _ in train_loader:
+        for batch_index, (conditions, pv_year, target, _) in enumerate(train_loader, 1):
             optimizer.zero_grad(set_to_none=True)
             loss = model(target.to(device), conditions.to(device), pv_year.to(device))
             if not torch.isfinite(loss):
@@ -132,16 +155,25 @@ def train(config, run_name=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(training["gradient_clip"]),
                                           error_if_nonfinite=True)
             optimizer.step()
-            with torch.no_grad():
-                for average, current in zip(ema.parameters(), model.parameters()):
-                    average.lerp_(current, 1 - decay)
-                for average, current in zip(ema.buffers(), model.buffers()):
-                    average.copy_(current)
+            if decay > 0:
+                with torch.no_grad():
+                    for average, current in zip(ema.parameters(), model.parameters()):
+                        average.lerp_(current, 1 - decay)
+                    for average, current in zip(ema.buffers(), model.buffers()):
+                        average.copy_(current)
             loss_sum += loss.item() * len(target)
             seen += len(target)
-        record = {"epoch": epoch, "train_loss": loss_sum / seen}
+            progress.emit(phase="batch_done", batch=batch_index, batches=len(train_loader))
+        synchronize(device)
+        training_seconds = time.perf_counter() - epoch_started
+        progress.emit(force=True, phase="done", batches=len(train_loader))
+        record = {"epoch": epoch, "train_loss": loss_sum / seen,
+                  "training_seconds": training_seconds}
         if epoch % int(training["val_every"]) == 0 or epoch == int(training["epochs"]):
+            validation_started = time.perf_counter()
             metrics = validate(ema, val_loader, val_data, config, device)
+            synchronize(device)
+            record["validation_seconds"] = time.perf_counter() - validation_started
             record.update(metrics)
             score = metrics["val_macro_nCRPS"]
             if not np.isfinite(score):
@@ -161,6 +193,7 @@ def train(config, run_name=None):
                 (run_dir / "best_metrics.json").write_text(json.dumps({"epoch": epoch, **metrics}, indent=2))
             else:
                 stale += 1
+        record["epoch_seconds"] = time.perf_counter() - epoch_started
         with (run_dir / "history.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
         print(json.dumps(record), flush=True)

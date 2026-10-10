@@ -48,7 +48,7 @@ def test_no_current_or_future_target_in_rnn_condition(tiny_config):
         out, state = model.rnn(model.rnn_input(previous, covariates[:, h:h+1]), state)
         sequential.append(model.proj_dist_args(out))
     torch.testing.assert_close(first, torch.cat(sequential, dim=1))
-    assert list(inspect.signature(model.sample).parameters) == ["conditions", "year", "generator"]
+    assert list(inspect.signature(model.sample).parameters) == ["conditions", "year", "generator", "progress"]
 
 
 def test_condition_gradients_joint_channels_and_sampling(tiny_config):
